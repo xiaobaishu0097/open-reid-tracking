@@ -12,7 +12,8 @@ import json
 
 from reid import models
 from reid.utils.my_utils import *
-from reid.trainers import Trainer, CamStyleTrainer
+from reid.trainers import Trainer
+from reid.camstyle_trainer import CamStyleTrainer
 from reid.evaluators import Evaluator
 from reid.utils.logging import Logger
 from reid.utils.serialization import save_checkpoint
@@ -45,7 +46,7 @@ def main(args):
     # Create model
     model = models.create('ide', num_features=args.features, norm=args.norm,
                           dropout=args.dropout, num_classes=num_classes, last_stride=args.last_stride,
-                          output_feature=args.output_feature)
+                          output_feature=args.output_feature, arch=args.arch)
 
     # Load from checkpoint
     start_epoch = best_top1 = 0
@@ -65,7 +66,7 @@ def main(args):
         return
 
     # Criterion
-    criterion = nn.CrossEntropyLoss().cuda() if not args.LSR else LSR_loss()
+    criterion = nn.CrossEntropyLoss().cuda() if not args.LSR else LSR_loss().cuda()
 
     if args.train:
         # Optimizer
@@ -144,7 +145,7 @@ if __name__ == '__main__':
     # data
     parser.add_argument('-d', '--dataset', type=str, default='market1501', choices=datasets.names())
     parser.add_argument('-b', '--batch-size', type=int, default=64, help="batch size")
-    parser.add_argument('-j', '--num-workers', type=int, default=8)
+    parser.add_argument('-j', '--num-workers', type=int, default=4)
     parser.add_argument('--height', type=int, default=256, help="input height, default: 256 for resnet*")
     parser.add_argument('--width', type=int, default=128, help="input width, default: 128 for resnet*")
     parser.add_argument('--combine-trainval', action='store_true',
@@ -165,6 +166,8 @@ if __name__ == '__main__':
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight-decay', type=float, default=5e-4)
     parser.add_argument('--LSR', action='store_true', help="use label smooth loss")
+    parser.add_argument('--arch', type=str, default='resnet50', choices=['resnet50', 'densenet121'],
+                        help='architecture for base network')
     # training configs
     parser.add_argument('--train', action='store_true', help="train IDE model from start")
     parser.add_argument('--crop', action='store_true', help="resize then crop, default: False")

@@ -10,7 +10,7 @@ import xml.dom.minidom as XD
 
 class AI_City(object):
 
-    def __init__(self, root, type='reid', fps=5, trainval=False, gt_type='gt'):
+    def __init__(self, root, type='reid', fps=10, trainval=False, gt_type='gt'):
         if type == 'tracking_gt':
             if not trainval:
                 train_dir = '~/Data/AIC19/ALL_{}_bbox/train'.format(gt_type)
@@ -24,12 +24,13 @@ class AI_City(object):
             self.train_path = root
             self.gallery_path = None
             self.query_path = None
-        else:  # reid
+        elif type == 'reid':  # reid
             root = osp.expanduser('~/Data/AIC19-reid')
             self.train_path = osp.join(root, 'image_train')
-            val_dir = '~/Data/AIC19/ALL_gt_bbox/val'
-            self.gallery_path = osp.join(osp.expanduser(val_dir), 'gt_bbox_1_fps')
-            self.query_path = osp.join(osp.expanduser(val_dir), 'gt_bbox_1_fps')
+            query_dir = '~/Data/VeRi/image_query/'
+            gallery_dir = '~/Data/VeRi/image_test/'
+            self.gallery_path = osp.expanduser(gallery_dir)
+            self.query_path = osp.expanduser(query_dir)
 
             xml_dir = osp.join(root, 'train_label.xml')
             self.reid_info = XD.parse(xml_dir).documentElement.getElementsByTagName('Item')
@@ -37,6 +38,11 @@ class AI_City(object):
             for index in range(len(self.reid_info)):
                 fname = self.reid_info[index].getAttribute('imageName')
                 self.index_by_fname_dict[fname] = index
+        else:  # reid_test
+            self.train_path = None
+            root = osp.expanduser('~/Data/AIC19-reid')
+            self.gallery_path = osp.join(root, 'image_test')
+            self.query_path = osp.join(root, 'image_query')
 
         self.train, self.query, self.gallery = [], [], []
         self.num_train_ids, self.num_query_ids, self.num_gallery_ids = 0, 0, 0
@@ -46,7 +52,7 @@ class AI_City(object):
 
     def preprocess(self, path, relabel=True, type='reid'):
         if type == 'tracking_det':
-            pattern = re.compile(r'c(\d+)_f(\d+)')
+            pattern = re.compile(r'c([-\d]+)_f(\d+)')
         elif type == 'tracking_gt':
             pattern = re.compile(r'([-\d]+)_c(\d+)')
         else:  # reid
@@ -63,9 +69,11 @@ class AI_City(object):
                 pid = 1
             elif type == 'tracking_gt':
                 pid, cam = map(int, pattern.search(fname).groups())
-            else:  # reid
+            elif type == 'reid':  # reid
                 pid, cam = map(int, [self.reid_info[self.index_by_fname_dict[fname]].getAttribute('vehicleID'),
                                      self.reid_info[self.index_by_fname_dict[fname]].getAttribute('cameraID')[1:]])
+            else:  # reid test
+                pid, cam = 1, 1
             if pid == -1: continue
             if relabel:
                 if pid not in all_pids:
@@ -80,8 +88,10 @@ class AI_City(object):
 
     def load(self):
         self.train, self.num_train_ids = self.preprocess(self.train_path, True, self.type)
-        self.gallery, self.num_gallery_ids = self.preprocess(self.gallery_path, False, 'tracking_gt')
-        self.query, self.num_query_ids = self.preprocess(self.query_path, False, 'tracking_gt')
+        self.gallery, self.num_gallery_ids = self.preprocess(self.gallery_path, False,
+                                                             'reid_test' if self.type == 'reid_test' else 'tracking_gt')
+        self.query, self.num_query_ids = self.preprocess(self.query_path, False,
+                                                         'reid_test' if self.type == 'reid_test' else 'tracking_gt')
 
         print(self.__class__.__name__, "dataset loaded")
         print("  subset   | # ids | # images")

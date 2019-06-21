@@ -9,6 +9,7 @@ import sys
 import torch
 from torch.backends import cudnn
 import json
+from bisect import bisect_right
 
 from reid import models
 from reid.utils.my_utils import *
@@ -16,20 +17,24 @@ from reid.trainers import Trainer
 from reid.evaluators import Evaluator
 from reid.utils.logging import Logger
 from reid.utils.serialization import save_checkpoint
+from reid.loss import *
 
 '''
-    ideas for better training from Dr. Yifan Sun
-    
-    train resnet BN by default                              check
-    no crop                                                 check
-    batch_size = 64 , lr = 0.1                              check
-    dropout -- possible at layer: pool5                     check
-    skip step-3 in RPP training                             check
-    RPP classifier -- 2048 -> 256 -> 6 (average pooling)    check
+tricks from ZJU paper
+
+baseline-S          check
+warmup              ()
+re                  ()
+lsr                 ()
+s=1                 ()
+BNneck              ()
+centerloss          skip
 '''
 
 
 def main(args):
+    args.step_size = args.step_size.split(',')
+    args.step_size = [int(x) for x in args.step_size]
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     cudnn.benchmark = True
@@ -44,12 +49,13 @@ def main(args):
     # Create data loaders
     dataset, num_classes, train_loader, query_loader, gallery_loader, camstyle_loader = \
         get_data(args.dataset, args.data_dir, args.height, args.width, args.batch_size, args.num_workers,
-                 args.combine_trainval, args.crop, args.tracking_icams, args.tracking_fps, args.re, 0, args.camstyle)
+                 args.combine_trainval, args.crop, args.tracking_icams, args.tracking_fps, args.re, args.num_instances,
+                 camstyle=0, zju=1, colorjitter=args.colorjitter)
 
     # Create model
-    model = models.create('pcb', num_features=args.features, norm=args.norm,
-                          dropout=args.dropout, num_classes=num_classes, last_stride=args.last_stride,
-                          output_feature=args.output_feature)
+    model = models.create('zju', num_features=args.features, norm=args.norm,
+                          num_classes=num_classes, last_stride=args.last_stride,
+                          output_feature=args.output_feature, backbone=args.backbone, BNneck=args.BNneck)
 
     # Load from checkpoint
     start_epoch = best_top1 = 0
@@ -58,7 +64,7 @@ def main(args):
             model, start_epoch, best_top1 = checkpoint_loader(model, args.resume, eval_only=True)
         else:
             model, start_epoch, best_top1 = checkpoint_loader(model, args.resume)
-        print("=> Start epoch {}  best top1 {:.1%}".format(start_epoch, best_top1))
+        print("=> Start epoch {}  best top1_eval {:.1%}".format(start_epoch, best_top1))
     model = nn.DataParallel(model).cuda()
 
     # Evaluator
@@ -69,29 +75,42 @@ def main(args):
         return
 
     # Criterion
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = [LSR_loss().cuda() if args.LSR else nn.CrossEntropyLoss().cuda(),
+                 TripletLoss(margin=None if args.softmargin else args.margin).cuda()]
 
     if args.train:
         # Optimizer
-        if hasattr(model.module, 'base'):  # low learning_rate the base network (aka. ResNet-50)
-            base_param_ids = set(map(id, model.module.base.parameters()))
-            new_params = [p for p in model.parameters() if id(p) not in base_param_ids]
-            param_groups = [{'params': model.module.base.parameters(), 'lr_mult': 0.1},
-                            {'params': new_params, 'lr_mult': 1.0}]
+        if 'aic' in args.dataset:
+            # Optimizer
+            if hasattr(model.module, 'base'):  # low learning_rate the base network (aka. DenseNet-121)
+                base_param_ids = set(map(id, model.module.base.parameters()))
+                new_params = [p for p in model.parameters() if id(p) not in base_param_ids]
+                param_groups = [{'params': model.module.base.parameters(), 'lr_mult': 1},
+                                {'params': new_params, 'lr_mult': 2}]
+            else:
+                param_groups = model.parameters()
+            optimizer = torch.optim.SGD(param_groups, lr=args.lr, momentum=args.momentum,
+                                        weight_decay=args.weight_decay)
         else:
-            param_groups = model.parameters()
-        optimizer = torch.optim.SGD(param_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay,
-                                    nesterov=True)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, )
 
         # Trainer
         trainer = Trainer(model, criterion)
 
         # Schedule learning rate
         def adjust_lr(epoch):
-            step_size = args.step_size
-            lr = args.lr * (0.1 ** (epoch // step_size))
+            if epoch < args.warmup:
+                alpha = epoch / args.warmup
+                warmup_factor = 0.01 * (1 - alpha) + alpha
+            else:
+                warmup_factor = 1
+            lr = args.lr * warmup_factor * (0.1 ** bisect_right(args.step_size, epoch))
+            print('Current learning rate: {}'.format(lr))
             for g in optimizer.param_groups:
-                g['lr'] = lr * g.get('lr_mult', 1)
+                if 'aic' in args.dataset:
+                    g['lr'] = lr * g.get('lr_mult', 1)
+                else:
+                    g['lr'] = lr
 
         # Draw Curve
         epoch_s = []
@@ -103,20 +122,23 @@ def main(args):
             t0 = time.time()
             adjust_lr(epoch)
             # train_loss, train_prec = 0, 0
-            train_loss, train_prec = trainer.train(epoch, train_loader, optimizer, fix_bn=args.fix_bn)
+            train_loss, train_prec = trainer.train(epoch, train_loader, optimizer, fix_bn=args.fix_bn, print_freq=120)
 
             if epoch < args.start_save:
                 continue
-            # skip evaluate
-            top1 = 50
 
-            is_best = top1 >= best_top1
-            best_top1 = max(top1, best_top1)
+            if (epoch + 1) % 20 == 0:
+                evaluator.evaluate(query_loader, gallery_loader, dataset.query, dataset.gallery, eval_only=True)
+
+            # skip evaluate
+            top1_eval = 50
+
+            is_best = top1_eval >= best_top1
+            best_top1 = max(top1_eval, best_top1)
             save_checkpoint({
                 'state_dict': model.module.state_dict(),
                 'epoch': epoch + 1,
                 'best_top1': best_top1,
-                'rpp': False,
             }, is_best, fpath=osp.join(args.logs_dir, 'checkpoint_{}.pth.tar'.format(date_str)))
             epoch_s.append(epoch)
             loss_s.append(train_loss)
@@ -125,10 +147,10 @@ def main(args):
 
             t1 = time.time()
             t_epoch = t1 - t0
-            print('\n * Finished epoch {:3d}  top1: {:5.1%}  best: {:5.1%}\n'.
-                  format(epoch, top1, best_top1, ' *' if is_best else ''))
-            print(
-                '*************** Epoch takes time: {:^10.2f} *********************\n'.format(t_epoch))
+            print('\n * Finished epoch {:3d}  top1_eval: {:5.1%}  best_eval: {:5.1%} \n'.
+                  format(epoch, top1_eval, best_top1, ' *' if is_best else ''))
+            print('*************** Epoch takes time: {:^10.2f} *********************\n'.format(t_epoch))
+            pass
 
         # Final test
         print('Test with best model:')
@@ -140,44 +162,55 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Softmax loss classification")
+    parser = argparse.ArgumentParser(description="ZJU baseline without center loss")
     parser.add_argument('--log', type=bool, default=1)
     # data
     parser.add_argument('-d', '--dataset', type=str, default='market1501', choices=datasets.names())
     parser.add_argument('-b', '--batch-size', type=int, default=64, help="batch size")
     parser.add_argument('-j', '--num-workers', type=int, default=4)
-    parser.add_argument('--height', type=int, default=384, help="input height, default: 384 for PCB*")
+    parser.add_argument('--height', type=int, default=256, help="input height, default: 256 for resnet*")
     parser.add_argument('--width', type=int, default=128, help="input width, default: 128 for resnet*")
     parser.add_argument('--combine-trainval', action='store_true',
                         help="train and val sets together for training, val set alone for validation")
     parser.add_argument('--tracking_icams', type=int, default=0, help="specify if train on single iCam")
     parser.add_argument('--tracking_fps', type=int, default=1, help="specify if train on single iCam")
     parser.add_argument('--re', type=float, default=0, help="random erasing")
+    parser.add_argument('--crop', type=bool, default=1, help="resize then crop, default: True")
+    parser.add_argument('--colorjitter', action='store_true', help="resize then crop, default: True")
+    # loss
+    parser.add_argument('--margin', type=float, default=0.3, help="margin of the triplet loss, default: 0.3")
+    parser.add_argument('--softmargin', action='store_true', help="use softmargin triplet loss, default: false")
+    parser.add_argument('--num-instances', type=int, default=4,
+                        help="each minibatch consist of "
+                             "(batch_size // num_instances) identities, and "
+                             "each identity has num_instances instances, default: 4")
     # model
-    parser.add_argument('--features', type=int, default=256)
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('-s', '--last_stride', type=int, default=1, choices=[1, 2])
-    parser.add_argument('--output_feature', type=str, default='fc', choices=['pool5', 'fc'])
+    parser.add_argument('--features', type=int, default=0)
+    parser.add_argument('--dropout', type=float, default=0)
+    parser.add_argument('-s', '--last_stride', type=int, default=2, choices=[1, 2])
+    parser.add_argument('--output_feature', type=str, default='pool5', choices=['pool5', 'fc'])
     parser.add_argument('--norm', action='store_true', help="normalize feat, default: False")
+    parser.add_argument('--BNneck', action='store_true', help="BN layer, default: False")
+    parser.add_argument('--backbone', type=str, default='resnet50', choices=['resnet50', 'densenet121'],
+                        help='architecture for base network')
     # optimizer
-    parser.add_argument('--lr', type=float, default=0.1,
+    parser.add_argument('--lr', type=float, default=0.00035,
                         help="learning rate of new parameters, for pretrained "
                              "parameters it is 10 times smaller than this")
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight-decay', type=float, default=5e-4)
+    parser.add_argument('--LSR', action='store_true', help="use label smooth loss")
     # training configs
-    parser.add_argument('--train', action='store_true', help="train PCB model from start")
-    parser.add_argument('--crop', action='store_true', help="resize then crop, default: False")
+    parser.add_argument('--train', action='store_true', help="train IDE model from start")
     parser.add_argument('--fix_bn', type=bool, default=0, help="fix (skip training) BN in base network")
     parser.add_argument('--resume', type=str, default='', metavar='PATH')
     parser.add_argument('--evaluate', action='store_true', help="evaluation only")
-    parser.add_argument('--epochs', type=int, default=60)
-    parser.add_argument('--step-size', type=int, default=40)
+    parser.add_argument('--warmup', type=int, default=0)
+    parser.add_argument('--epochs', type=int, default=120)
+    parser.add_argument('--step-size', default='30,60,80')
     parser.add_argument('--start_save', type=int, default=0, help="start saving checkpoints after specific epoch")
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--print-freq', type=int, default=1)
-    # camstyle batchsize
-    parser.add_argument('--camstyle', type=int, default=0)
     # misc
     working_dir = osp.dirname(osp.abspath(__file__))
     parser.add_argument('--data-dir', type=str, metavar='PATH', default=osp.join(working_dir, 'data'))
